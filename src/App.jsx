@@ -5,6 +5,7 @@ const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000/api/v1';
 export default function App() {
   const [token, setToken] = useState(() => localStorage.getItem('token') || '');
   const [userRole, setUserRole] = useState(() => localStorage.getItem('role') || '');
+  const [username, setUsername] = useState(() => localStorage.getItem('username') || '');
   const [currentTab, setCurrentTab] = useState('books');
   const [errorMsg, setErrorMsg] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
@@ -32,6 +33,16 @@ export default function App() {
   const [loanModal, setLoanModal] = useState(false);
   const [loanForm, setLoanForm] = useState({ member_id: '', items: ['', '', ''] });
 
+  const [memberNames, setMemberNames] = useState({});
+  const [loanMemberQuery, setLoanMemberQuery] = useState('');
+  const [loanMembers, setLoanMembers] = useState([]);
+  const [loanBookQuery, setLoanBookQuery] = useState('');
+  const [loanBooks, setLoanBooks] = useState([]);
+  const [bookCache, setBookCache] = useState({});
+
+  // Team State (HU-02: el administrador da de alta bibliotecarios)
+  const [newLibrarian, setNewLibrarian] = useState({ username: '', password: '' });
+
   // Overdue State
   const [overdueList, setOverdueList] = useState([]);
 
@@ -42,10 +53,20 @@ export default function App() {
   });
   const [reportRows, setReportRows] = useState([]);
 
+  const closeSession = () => {
+    setToken('');
+    setUserRole('');
+    setUsername('');
+    ['token', 'role', 'username'].forEach(key => localStorage.removeItem(key));
+  };
+
   // Auth fetch helper
   const apiFetch = async (endpoint, options = {}) => {
-    setErrorMsg('');
-    setSuccessMsg('');
+    const isMutation = options.method && options.method !== 'GET';
+    if (isMutation) {
+      setErrorMsg('');
+      setSuccessMsg('');
+    }
     const headers = {
       'Content-Type': 'application/json',
       ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
@@ -55,6 +76,11 @@ export default function App() {
     try {
       const res = await fetch(`${API_BASE}${endpoint}`, { ...options, headers });
       const data = await res.json().catch(() => null);
+
+      if (res.status === 401 && token && endpoint !== '/auth/login') {
+        closeSession();
+        throw new Error('Tu sesiÃ³n terminÃ³. Vuelve a iniciar sesiÃ³n.');
+      }
 
       if (!res.ok) {
         let msg = data?.message || `Error del servidor (${res.status})`;
@@ -80,20 +106,18 @@ export default function App() {
       });
       setToken(data.access_token);
       setUserRole(data.role);
+      setUsername(loginForm.username.trim().toLowerCase());
       localStorage.setItem('token', data.access_token);
       localStorage.setItem('role', data.role);
-      setSuccessMsg('Inicio de sesiÃƒÂ³n exitoso');
+      localStorage.setItem('username', loginForm.username.trim().toLowerCase());
+      setLoginForm({ username: '', password: '' });
+      setSuccessMsg('Inicio de sesiÃ³n exitoso');
     } catch (err) {
       // Error handled by apiFetch
     }
   };
 
-  const handleLogout = () => {
-    setToken('');
-    setUserRole('');
-    localStorage.removeItem('token');
-    localStorage.removeItem('role');
-  };
+  const handleLogout = () => closeSession();
 
   // Load Categories
   const loadCategories = async () => {
@@ -126,8 +150,24 @@ export default function App() {
       const params = new URLSearchParams({ page: 1, size: 50 });
       if (memberSearch) params.append('q', memberSearch);
       const data = await apiFetch(`/members?${params.toString()}`);
-      if (data?.items) setMembers(data.items);
+      if (data?.items) {
+        setMembers(data.items);
+        rememberMembers(data.items);
+      }
     } catch (err) {}
+  };
+
+  const rememberMembers = (items) => setMemberNames(prev => {
+    const next = { ...prev };
+    items.forEach(m => { next[m.id] = m.full_name; });
+    return next;
+  });
+
+  // Los prÃ©stamos solo traen member_id: se resuelve el nombre con GET /members/{id}.
+  const resolveMemberNames = async (items) => {
+    const missing = [...new Set(items.map(l => l.member_id))].filter(id => !memberNames[id]);
+    const found = await Promise.all(missing.map(id => apiFetch(`/members/${id}`).catch(() => null)));
+    rememberMembers(found.filter(Boolean));
   };
 
   // Load Loans
@@ -135,7 +175,10 @@ export default function App() {
     if (!token) return;
     try {
       const data = await apiFetch('/loans?page=1&size=20');
-      if (data?.items) setLoans(data.items);
+      if (data?.items) {
+        setLoans(data.items);
+        resolveMemberNames(data.items);
+      }
     } catch (err) {}
   };
 
@@ -166,7 +209,52 @@ export default function App() {
       if (currentTab === 'overdue') loadOverdue();
       if (currentTab === 'reports') loadReports();
     }
-  }, [token, currentTab, booksPage, searchQuery, selectedCategory]);
+  }, [token, currentTab, booksPage, searchQuery, selectedCategory, memberSearch]);
+
+  // El formulario de prÃ©stamo busca en toda la colecciÃ³n, no solo en la pÃ¡gina visible del catÃ¡logo.
+  useEffect(() => {
+    if (!token || !loanModal) return;
+    const timer = setTimeout(async () => {
+      try {
+        const params = new URLSearchParams({ page: 1, size: 50 });
+        if (loanBookQuery) params.append('q', loanBookQuery);
+        const data = await apiFetch(`/books?${params.toString()}`);
+        if (data?.items) {
+          setLoanBooks(data.items);
+          setBookCache(prev => Object.fromEntries([...Object.entries(prev), ...data.items.map(b => [b.id, b])]));
+        }
+      } catch (err) {}
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [loanModal, loanBookQuery]);
+
+  useEffect(() => {
+    if (!token || !loanModal) return;
+    const timer = setTimeout(async () => {
+      try {
+        const params = new URLSearchParams({ page: 1, size: 50 });
+        if (loanMemberQuery) params.append('q', loanMemberQuery);
+        const data = await apiFetch(`/members?${params.toString()}`);
+        if (data?.items) {
+          setLoanMembers(data.items);
+          rememberMembers(data.items);
+        }
+      } catch (err) {}
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [loanModal, loanMemberQuery]);
+
+  const handleCreateLibrarian = async (e) => {
+    e.preventDefault();
+    try {
+      const created = await apiFetch('/users', {
+        method: 'POST',
+        body: JSON.stringify({ username: newLibrarian.username, password: newLibrarian.password, role: 'librarian' })
+      });
+      setSuccessMsg(`Bibliotecario Â«${created.username}Â» creado correctamente`);
+      setNewLibrarian({ username: '', password: '' });
+    } catch (err) {}
+  };
 
   // Book Handlers
   const handleSaveBook = async (e) => {
@@ -194,10 +282,10 @@ export default function App() {
   };
 
   const handleDeleteBook = async (id) => {
-    if (!window.confirm('Ã‚Â¿Seguro de dar de baja este libro?')) return;
+    if (!window.confirm('Â¿Seguro de dar de baja este libro?')) return;
     try {
       await apiFetch(`/books/${id}`, { method: 'DELETE' });
-      setSuccessMsg('Libro dado de baja (baja lÃƒÂ³gica aplicada)');
+      setSuccessMsg('Libro dado de baja (baja lÃ³gica aplicada)');
       loadBooks();
     } catch (err) {}
   };
@@ -207,7 +295,7 @@ export default function App() {
     e.preventDefault();
     try {
       await apiFetch('/members', { method: 'POST', body: JSON.stringify(newMember) });
-      setSuccessMsg('Socio registrado con ÃƒÂ©xito');
+      setSuccessMsg('Socio registrado con Ã©xito');
       setMemberModal(false);
       setNewMember({ full_name: '', document_number: '' });
       loadMembers();
@@ -228,7 +316,7 @@ export default function App() {
         method: 'POST',
         body: JSON.stringify({ member_id: loanForm.member_id, items: validBooks })
       });
-      setSuccessMsg('PrÃƒÂ©stamo registrado exitosamente');
+      setSuccessMsg('PrÃ©stamo registrado exitosamente');
       setLoanModal(false);
       setLoanForm({ member_id: '', items: ['', '', ''] });
       loadLoans();
@@ -255,26 +343,26 @@ export default function App() {
           <div className="auth-story-copy">
             <span className="eyebrow">ESPACIO DE LECTURA Y CONOCIMIENTO</span>
             <h1>Las historias<br />encuentran su lugar.</h1>
-            <p>Una forma mÃƒÂ¡s sencilla de organizar colecciones, acompaÃƒÂ±ar lectores y mantener cada prÃƒÂ©stamo en movimiento.</p>
-            <div className="story-stat"><span className="story-dot"></span> Plataforma de gestiÃƒÂ³n bibliotecaria</div>
+            <p>Una forma mÃ¡s sencilla de organizar colecciones, acompaÃ±ar lectores y mantener cada prÃ©stamo en movimiento.</p>
+            <div className="story-stat"><span className="story-dot"></span> Plataforma de gestiÃ³n bibliotecaria</div>
           </div>
-          <div className="auth-footnote">MANAGER LIBRARY Ã‚Â· ADSO 3413974</div>
+          <div className="auth-footnote">MANAGER LIBRARY</div>
         </section>
         <section className="auth-panel">
           <div className="auth-card">
             <div className="auth-mobile-brand"><span className="brand-mark">N</span><b>NEXO Biblioteca</b></div>
             <span className="eyebrow">ACCESO DE PERSONAL</span>
-            <h2>QuÃƒÂ© bueno verte.</h2>
+            <h2>QuÃ© bueno verte.</h2>
             <p className="auth-subtitle">Ingresa tus datos para continuar al espacio de trabajo.</p>
             {errorMsg && <div className="alert-error" role="alert">{errorMsg}</div>}
             <form onSubmit={handleLogin} className="auth-form">
               <label>Usuario
                 <input type="text" autoComplete="username" required value={loginForm.username} onChange={e => setLoginForm({ ...loginForm, username: e.target.value })} placeholder="Tu usuario" />
               </label>
-              <label>ContraseÃƒÂ±a
-                <input type="password" autoComplete="current-password" required value={loginForm.password} onChange={e => setLoginForm({ ...loginForm, password: e.target.value })} placeholder="Ingresa tu contraseÃƒÂ±a" />
+              <label>ContraseÃ±a
+                <input type="password" autoComplete="current-password" required value={loginForm.password} onChange={e => setLoginForm({ ...loginForm, password: e.target.value })} placeholder="Ingresa tu contraseÃ±a" />
               </label>
-              <button type="submit" className="btn-primary auth-submit">Entrar al sistema <span aria-hidden="true">Ã¢â€ â€™</span></button>
+              <button type="submit" className="btn-primary auth-submit">Entrar al sistema <span aria-hidden="true">â†’</span></button>
             </form>
             <p className="auth-privacy">Acceso privado para personal autorizado.</p>
           </div>
@@ -284,28 +372,31 @@ export default function App() {
   }
 
   const navItems = [
-    { id: 'books', label: 'CatÃƒÂ¡logo', icon: 'Ã¢â€“Â¤', detail: 'ColecciÃƒÂ³n' },
-    { id: 'members', label: 'Lectores', icon: 'Ã¢â„¢â„¢', detail: 'Comunidad' },
-    { id: 'loans', label: 'CirculaciÃƒÂ³n', icon: 'Ã¢â€¡â€ž', detail: 'PrÃƒÂ©stamos' },
-    { id: 'overdue', label: 'Vencimientos', icon: 'Ã¢â€”Â·', detail: 'Seguimiento' },
-    ...(userRole === 'admin' ? [{ id: 'reports', label: 'AnalÃƒÂ­tica', icon: 'Ã¢â€“Â¥', detail: 'Informes' }] : [])
+    { id: 'books', label: 'CatÃ¡logo', icon: 'â–¤', detail: 'ColecciÃ³n' },
+    { id: 'members', label: 'Lectores', icon: 'â™™', detail: 'Comunidad' },
+    { id: 'loans', label: 'CirculaciÃ³n', icon: 'â‡„', detail: 'PrÃ©stamos' },
+    { id: 'overdue', label: 'Vencimientos', icon: 'â—·', detail: 'Seguimiento' },
+    ...(userRole === 'admin' ? [
+      { id: 'reports', label: 'MÃ¡s prestados', icon: 'â–¥', detail: 'Informe' },
+      { id: 'team', label: 'Equipo', icon: 'â™Ÿ', detail: 'Bibliotecarios' }
+    ] : [])
   ];
-  const pageNames = { books: 'CatÃƒÂ¡logo de libros', members: 'Directorio de lectores', loans: 'CirculaciÃƒÂ³n de ejemplares', overdue: 'PrÃƒÂ©stamos por revisar', reports: 'Actividad de la biblioteca' };
+  const pageNames = { books: 'CatÃ¡logo de libros', members: 'Directorio de lectores', loans: 'CirculaciÃ³n de ejemplares', overdue: 'PrÃ©stamos por revisar', reports: 'Libros mÃ¡s prestados', team: 'Equipo de la biblioteca' };
 
   return (
     <div className="workspace">
       <aside className="sidebar">
         <div className="sidebar-brand"><span className="brand-mark">N</span><span>NEXO<small>BIBLIOTECA</small></span></div>
         <div className="sidebar-caption">ESPACIO DE TRABAJO</div>
-        <nav className="side-nav" aria-label="NavegaciÃƒÂ³n principal">
+        <nav className="side-nav" aria-label="NavegaciÃ³n principal">
           {navItems.map(tab => (
             <button key={tab.id} onClick={() => setCurrentTab(tab.id)} className={`side-link ${currentTab === tab.id ? 'active' : ''}`}>
-              <span className="side-icon">{tab.icon}</span><span className="side-link-copy"><b>{tab.label}</b><small>{tab.detail}</small></span>{currentTab === tab.id && <span className="side-current">Ã¢â€”Â</span>}
+              <span className="side-icon">{tab.icon}</span><span className="side-link-copy"><b>{tab.label}</b><small>{tab.detail}</small></span>{currentTab === tab.id && <span className="side-current">â—</span>}
             </button>
           ))}
         </nav>
-        <div className="sidebar-bottom"><div className="sidebar-note"><span className="note-mark">Ã¢Å“Â¦</span><b>Un lugar para cada historia</b><p>Organiza recursos y acompaÃƒÂ±a cada lectura.</p></div>
-          <div className="profile-row"><div className="avatar">{(loginForm.username || 'A').slice(0,1).toUpperCase()}</div><div className="profile-copy"><b>{loginForm.username || 'Personal'}</b><small>{userRole === 'admin' ? 'Administrador' : 'Bibliotecario'}</small></div><button className="logout-button" onClick={handleLogout} title="Cerrar sesiÃƒÂ³n" aria-label="Cerrar sesiÃƒÂ³n">Ã¢â€ â€”</button></div>
+        <div className="sidebar-bottom"><div className="sidebar-note"><span className="note-mark">âœ¦</span><b>Un lugar para cada historia</b><p>Organiza recursos y acompaÃ±a cada lectura.</p></div>
+          <div className="profile-row"><div className="avatar">{(username || 'A').slice(0,1).toUpperCase()}</div><div className="profile-copy"><b>{username || 'Personal'}</b><small>{userRole === 'admin' ? 'Administrador' : 'Bibliotecario'}</small></div><button className="logout-button" onClick={handleLogout} title="Cerrar sesiÃ³n" aria-label="Cerrar sesiÃ³n">â†—</button></div>
         </div>
       </aside>
       <div className="workspace-main">
@@ -313,7 +404,7 @@ export default function App() {
         <div className="workspace-content">
           {errorMsg && <div className="alert-error global-alert" role="alert">{errorMsg}</div>}
           {successMsg && <div className="alert-success global-alert" role="status">{successMsg}</div>}
-          <div className="content-intro"><div><span className="eyebrow">PANEL DE GESTIÃƒâ€œN</span><p>Administra los recursos y revisa la actividad de tu biblioteca.</p></div><span className="today-label">NEXO <span>Ã¢â‚¬Â¢</span> GESTIÃƒâ€œN</span></div>
+          <div className="content-intro"><div><span className="eyebrow">PANEL DE GESTIÃ“N</span><p>Administra los recursos y revisa la actividad de tu biblioteca.</p></div><span className="today-label">NEXO <span>â€¢</span> GESTIÃ“N</span></div>
           <main className="content-main">
       {/* BOOKS TAB */}
         {currentTab === 'books' && (
@@ -322,7 +413,7 @@ export default function App() {
               <div style={{ display: 'flex', gap: '0.5rem', flex: 1, minWidth: '300px' }}>
                 <input
                   type="text"
-                  placeholder="Buscar por tÃƒÂ­tulo o autor..."
+                  placeholder="Buscar por tÃ­tulo o autor..."
                   value={searchQuery}
                   onChange={e => setSearchQuery(e.target.value)}
                   style={{ flex: 1, padding: '0.6rem 0.75rem', border: '1px solid #cbd5e1', borderRadius: '6px', fontSize: '0.9rem' }}
@@ -332,7 +423,7 @@ export default function App() {
                   onChange={e => setSelectedCategory(e.target.value)}
                   style={{ padding: '0.6rem', border: '1px solid #cbd5e1', borderRadius: '6px', fontSize: '0.9rem' }}
                 >
-                  <option value="">Todas las CategorÃƒÂ­as</option>
+                  <option value="">Todas las CategorÃ­as</option>
                   {categories.map(c => (
                     <option key={c.id} value={c.id}>{c.name}</option>
                   ))}
@@ -352,10 +443,10 @@ export default function App() {
               <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.9rem' }}>
                 <thead style={{ background: '#f8fafc', borderBottom: '1px solid #e2e8f0', color: '#475569', fontWeight: 600 }}>
                   <tr>
-                    <th style={{ padding: '0.75rem 1rem' }}>TÃƒÂ­tulo</th>
+                    <th style={{ padding: '0.75rem 1rem' }}>TÃ­tulo</th>
                     <th style={{ padding: '0.75rem 1rem' }}>Autor</th>
                     <th style={{ padding: '0.75rem 1rem' }}>ISBN</th>
-                    <th style={{ padding: '0.75rem 1rem' }}>CategorÃƒÂ­a</th>
+                    <th style={{ padding: '0.75rem 1rem' }}>CategorÃ­a</th>
                     <th style={{ padding: '0.75rem 1rem' }}>Disponibles</th>
                     {userRole === 'admin' && <th style={{ padding: '0.75rem 1rem', textAlign: 'right' }}>Acciones</th>}
                   </tr>
@@ -364,7 +455,7 @@ export default function App() {
                   {books.length === 0 ? (
                     <tr>
                       <td colSpan={userRole === 'admin' ? 6 : 5} style={{ padding: '2rem', textAlign: 'center', color: '#64748b' }}>
-                        No se encontraron libros en el catÃƒÂ¡logo.
+                        No se encontraron libros en el catÃ¡logo.
                       </td>
                     </tr>
                   ) : (
@@ -440,7 +531,7 @@ export default function App() {
                   <tr>
                     <th style={{ padding: '0.75rem 1rem' }}>Nombre Completo</th>
                     <th style={{ padding: '0.75rem 1rem' }}>Documento</th>
-                    <th style={{ padding: '0.75rem 1rem' }}>ID ÃƒÅ¡nico</th>
+                    <th style={{ padding: '0.75rem 1rem' }}>ID Ãšnico</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -461,16 +552,16 @@ export default function App() {
         {currentTab === 'loans' && (
           <div>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.25rem' }}>
-              <h2 style={{ fontSize: '1.25rem', fontWeight: 700, color: '#1e293b' }}>PrÃƒÂ©stamos Activos y Devoluciones</h2>
+              <h2 style={{ fontSize: '1.25rem', fontWeight: 700, color: '#1e293b' }}>PrÃ©stamos Activos y Devoluciones</h2>
               <button
                 onClick={() => {
-                  loadMembers();
-                  loadBooks();
+                  setLoanMemberQuery('');
+                  setLoanBookQuery('');
                   setLoanModal(true);
                 }}
                 style={{ background: '#2563eb', color: '#fff', border: 'none', padding: '0.65rem 1.25rem', borderRadius: '6px', fontWeight: 600, fontSize: '0.9rem' }}
               >
-                + Nuevo PrÃƒÂ©stamo
+                + Nuevo PrÃ©stamo
               </button>
             </div>
 
@@ -480,8 +571,8 @@ export default function App() {
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem' }}>
                     <div>
                       <span style={{ fontSize: '0.85rem', color: '#64748b' }}>Fecha: {new Date(loan.loaned_at).toLocaleDateString()}</span>
-                      <span style={{ margin: '0 0.5rem', color: '#cbd5e1' }}>Ã¢â‚¬Â¢</span>
-                      <span style={{ fontSize: '0.85rem', color: '#64748b' }}>Socio: {loan.member_id}</span>
+                      <span style={{ margin: '0 0.5rem', color: '#cbd5e1' }}>â€¢</span>
+                      <span style={{ fontSize: '0.85rem', color: '#64748b' }}>Socio: {memberNames[loan.member_id] || 'Cargandoâ€¦'}</span>
                     </div>
                     <span style={{
                       padding: '0.2rem 0.6rem',
@@ -510,7 +601,7 @@ export default function App() {
                             onClick={() => handleReturnItem(loan.id, item.id)}
                             style={{ background: '#f8fafc', border: '1px solid #cbd5e1', color: '#2563eb', padding: '0.3rem 0.75rem', borderRadius: '4px', fontSize: '0.8rem', fontWeight: 600 }}
                           >
-                            Registrar DevoluciÃƒÂ³n
+                            Registrar DevoluciÃ³n
                           </button>
                         )}
                       </div>
@@ -527,7 +618,7 @@ export default function App() {
           <div>
             <div style={{ marginBottom: '1.25rem' }}>
               <h2 style={{ fontSize: '1.25rem', fontWeight: 700, color: '#1e293b' }}>Libros Vencidos y en Mora (HU-09)</h2>
-              <p style={{ color: '#64748b', fontSize: '0.9rem' }}>LÃƒÂ­neas de prÃƒÂ©stamo que han superado los 14 dÃƒÂ­as reglamentarios sin devoluciÃƒÂ³n.</p>
+              <p style={{ color: '#64748b', fontSize: '0.9rem' }}>LÃ­neas de prÃ©stamo que han superado los 14 dÃ­as reglamentarios sin devoluciÃ³n.</p>
             </div>
 
             <div style={{ background: '#fff', borderRadius: '8px', border: '1px solid #e2e8f0', overflow: 'hidden' }}>
@@ -537,15 +628,15 @@ export default function App() {
                     <th style={{ padding: '0.75rem 1rem' }}>Libro</th>
                     <th style={{ padding: '0.75rem 1rem' }}>Socio</th>
                     <th style={{ padding: '0.75rem 1rem' }}>Fecha de Vencimiento</th>
-                    <th style={{ padding: '0.75rem 1rem' }}>DÃƒÂ­as de Retraso</th>
-                    <th style={{ padding: '0.75rem 1rem', textAlign: 'right' }}>AcciÃƒÂ³n</th>
+                    <th style={{ padding: '0.75rem 1rem' }}>DÃ­as de Retraso</th>
+                    <th style={{ padding: '0.75rem 1rem', textAlign: 'right' }}>AcciÃ³n</th>
                   </tr>
                 </thead>
                 <tbody>
                   {overdueList.length === 0 ? (
                     <tr>
                       <td colSpan={5} style={{ padding: '2rem', textAlign: 'center', color: '#64748b' }}>
-                        Ã‚Â¡Excelente! No hay libros vencidos en este momento.
+                        Â¡Excelente! No hay libros vencidos en este momento.
                       </td>
                     </tr>
                   ) : (
@@ -556,7 +647,7 @@ export default function App() {
                         <td style={{ padding: '0.75rem 1rem', color: '#dc2626' }}>{new Date(item.due_at).toLocaleDateString()}</td>
                         <td style={{ padding: '0.75rem 1rem' }}>
                           <span style={{ background: '#fee2e2', color: '#b91c1c', padding: '0.2rem 0.5rem', borderRadius: '4px', fontWeight: 700, fontSize: '0.85rem' }}>
-                            {item.days_late} dÃƒÂ­as
+                            {item.days_late} dÃ­as
                           </span>
                         </td>
                         <td style={{ padding: '0.75rem 1rem', textAlign: 'right' }}>
@@ -580,8 +671,8 @@ export default function App() {
         {currentTab === 'reports' && userRole === 'admin' && (
           <div>
             <div style={{ marginBottom: '1.25rem' }}>
-              <h2 style={{ fontSize: '1.25rem', fontWeight: 700, color: '#1e293b' }}>Libros MÃƒÂ¡s Prestados (HU-10)</h2>
-              <p style={{ color: '#64748b', fontSize: '0.9rem' }}>Reporte agrupado por datos inmutables congelados en cada lÃƒÂ­nea de prÃƒÂ©stamo.</p>
+              <h2 style={{ fontSize: '1.25rem', fontWeight: 700, color: '#1e293b' }}>Libros MÃ¡s Prestados (HU-10)</h2>
+              <p style={{ color: '#64748b', fontSize: '0.9rem' }}>Reporte agrupado por datos inmutables congelados en cada lÃ­nea de prÃ©stamo.</p>
             </div>
 
             <div style={{ display: 'flex', gap: '1rem', alignItems: 'center', marginBottom: '1.5rem', background: '#fff', padding: '1rem', borderRadius: '8px', border: '1px solid #e2e8f0' }}>
@@ -615,16 +706,16 @@ export default function App() {
               <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.9rem' }}>
                 <thead style={{ background: '#f8fafc', borderBottom: '1px solid #e2e8f0', color: '#475569', fontWeight: 600 }}>
                   <tr>
-                    <th style={{ padding: '0.75rem 1rem' }}>TÃƒÂ­tulo Congelado</th>
-                    <th style={{ padding: '0.75rem 1rem' }}>CategorÃƒÂ­a Congelada</th>
-                    <th style={{ padding: '0.75rem 1rem' }}>PrÃƒÂ©stamos Concedidos</th>
+                    <th style={{ padding: '0.75rem 1rem' }}>TÃ­tulo Congelado</th>
+                    <th style={{ padding: '0.75rem 1rem' }}>CategorÃ­a Congelada</th>
+                    <th style={{ padding: '0.75rem 1rem' }}>PrÃ©stamos Concedidos</th>
                   </tr>
                 </thead>
                 <tbody>
                   {reportRows.length === 0 ? (
                     <tr>
                       <td colSpan={3} style={{ padding: '2rem', textAlign: 'center', color: '#64748b' }}>
-                        No hay prÃƒÂ©stamos registrados en el rango seleccionado.
+                        No hay prÃ©stamos registrados en el rango seleccionado.
                       </td>
                     </tr>
                   ) : (
@@ -646,6 +737,25 @@ export default function App() {
           </div>
         )}
 
+        {/* TEAM TAB (solo admin) */}
+        {currentTab === 'team' && userRole === 'admin' && (
+          <div style={{ maxWidth: '460px' }}>
+            <h2 style={{ fontSize: '1.25rem', fontWeight: 700, color: '#1e293b', marginBottom: '0.5rem' }}>Alta de bibliotecarios</h2>
+            <p style={{ color: '#64748b', fontSize: '0.9rem', marginBottom: '1.25rem' }}>Los bibliotecarios registran prÃ©stamos y devoluciones. El nombre de usuario se guarda en minÃºsculas.</p>
+            <form onSubmit={handleCreateLibrarian} style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: '8px', padding: '1.5rem' }}>
+              <div style={{ marginBottom: '1rem' }}>
+                <label htmlFor="librarian-username" style={{ display: 'block', fontSize: '0.85rem', fontWeight: 600, marginBottom: '0.25rem' }}>Usuario</label>
+                <input id="librarian-username" required autoComplete="off" value={newLibrarian.username} onChange={e => setNewLibrarian({ ...newLibrarian, username: e.target.value })} style={{ width: '100%', padding: '0.5rem', border: '1px solid #cbd5e1', borderRadius: '4px' }} />
+              </div>
+              <div style={{ marginBottom: '1.25rem' }}>
+                <label htmlFor="librarian-password" style={{ display: 'block', fontSize: '0.85rem', fontWeight: 600, marginBottom: '0.25rem' }}>ContraseÃ±a</label>
+                <input id="librarian-password" type="password" required autoComplete="new-password" value={newLibrarian.password} onChange={e => setNewLibrarian({ ...newLibrarian, password: e.target.value })} style={{ width: '100%', padding: '0.5rem', border: '1px solid #cbd5e1', borderRadius: '4px' }} />
+              </div>
+              <button type="submit" style={{ background: '#2563eb', color: '#fff', border: 'none', padding: '0.6rem 1.25rem', borderRadius: '6px', fontWeight: 600 }}>Crear bibliotecario</button>
+            </form>
+          </div>
+        )}
+
       </main>
 
       {/* Book Modal */}
@@ -657,7 +767,7 @@ export default function App() {
             </h3>
             <form onSubmit={handleSaveBook}>
               <div style={{ marginBottom: '1rem' }}>
-                <label style={{ display: 'block', fontSize: '0.85rem', fontWeight: 600, marginBottom: '0.25rem' }}>TÃƒÂ­tulo</label>
+                <label style={{ display: 'block', fontSize: '0.85rem', fontWeight: 600, marginBottom: '0.25rem' }}>TÃ­tulo</label>
                 <input name="title" defaultValue={bookModal.title || ''} required style={{ width: '100%', padding: '0.5rem', border: '1px solid #cbd5e1', borderRadius: '4px' }} />
               </div>
               <div style={{ marginBottom: '1rem' }}>
@@ -665,17 +775,17 @@ export default function App() {
                 <input name="author" defaultValue={bookModal.author || ''} required style={{ width: '100%', padding: '0.5rem', border: '1px solid #cbd5e1', borderRadius: '4px' }} />
               </div>
               <div style={{ marginBottom: '1rem' }}>
-                <label style={{ display: 'block', fontSize: '0.85rem', fontWeight: 600, marginBottom: '0.25rem' }}>ISBN (13 dÃƒÂ­gitos)</label>
+                <label style={{ display: 'block', fontSize: '0.85rem', fontWeight: 600, marginBottom: '0.25rem' }}>ISBN (13 dÃ­gitos)</label>
                 <input name="isbn" defaultValue={bookModal.isbn || ''} maxLength={13} required style={{ width: '100%', padding: '0.5rem', border: '1px solid #cbd5e1', borderRadius: '4px' }} />
               </div>
               <div style={{ marginBottom: '1rem' }}>
-                <label style={{ display: 'block', fontSize: '0.85rem', fontWeight: 600, marginBottom: '0.25rem' }}>CategorÃƒÂ­a</label>
+                <label style={{ display: 'block', fontSize: '0.85rem', fontWeight: 600, marginBottom: '0.25rem' }}>CategorÃ­a</label>
                 <select name="category_id" defaultValue={bookModal.category?.id || categories[0]?.id} required style={{ width: '100%', padding: '0.5rem', border: '1px solid #cbd5e1', borderRadius: '4px' }}>
                   {categories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
                 </select>
               </div>
               <div style={{ marginBottom: '1.5rem' }}>
-                <label style={{ display: 'block', fontSize: '0.85rem', fontWeight: 600, marginBottom: '0.25rem' }}>Ejemplares Totales (mÃ­nimo 1)</label>
+                <label style={{ display: 'block', fontSize: '0.85rem', fontWeight: 600, marginBottom: '0.25rem' }}>Ejemplares Totales (&gt;= 1)</label>
                 <input name="total_copies" type="number" min={1} defaultValue={bookModal.total_copies || 1} required style={{ width: '100%', padding: '0.5rem', border: '1px solid #cbd5e1', borderRadius: '4px' }} />
               </div>
               <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.75rem' }}>
@@ -703,7 +813,7 @@ export default function App() {
                 />
               </div>
               <div style={{ marginBottom: '1.5rem' }}>
-                <label style={{ display: 'block', fontSize: '0.85rem', fontWeight: 600, marginBottom: '0.25rem' }}>Documento de Identidad (ÃƒÅ¡nico)</label>
+                <label style={{ display: 'block', fontSize: '0.85rem', fontWeight: 600, marginBottom: '0.25rem' }}>Documento de Identidad (Ãšnico)</label>
                 <input
                   required
                   value={newMember.document_number}
@@ -724,10 +834,18 @@ export default function App() {
       {loanModal && (
         <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '1rem', zIndex: 100 }}>
           <div style={{ background: '#fff', borderRadius: '8px', padding: '2rem', width: '100%', maxWidth: '550px' }}>
-            <h3 style={{ fontSize: '1.25rem', fontWeight: 700, marginBottom: '1.25rem' }}>Registrar PrÃƒÂ©stamo</h3>
+            <h3 style={{ fontSize: '1.25rem', fontWeight: 700, marginBottom: '1.25rem' }}>Registrar PrÃ©stamo</h3>
             <form onSubmit={handleCreateLoan}>
               <div style={{ marginBottom: '1.25rem' }}>
-                <label style={{ display: 'block', fontSize: '0.85rem', fontWeight: 600, marginBottom: '0.25rem' }}>Socio Lector</label>
+                <label style={{ display: 'block', fontSize: '0.85rem', fontWeight: 600, marginBottom: '0.25rem' }}>Socio</label>
+                <input
+                  type="search"
+                  aria-label="Buscar socio por nombre o documento"
+                  placeholder="Buscar socio por nombre o documentoâ€¦"
+                  value={loanMemberQuery}
+                  onChange={e => setLoanMemberQuery(e.target.value)}
+                  style={{ width: '100%', padding: '0.5rem', border: '1px solid #cbd5e1', borderRadius: '4px', marginBottom: '0.5rem' }}
+                />
                 <select
                   required
                   value={loanForm.member_id}
@@ -735,7 +853,7 @@ export default function App() {
                   style={{ width: '100%', padding: '0.5rem', border: '1px solid #cbd5e1', borderRadius: '4px' }}
                 >
                   <option value="">Selecciona un socio...</option>
-                  {members.map(m => (
+                  {loanMembers.map(m => (
                     <option key={m.id} value={m.id}>{m.full_name} ({m.document_number})</option>
                   ))}
                 </select>
@@ -745,6 +863,14 @@ export default function App() {
                 <label style={{ display: 'block', fontSize: '0.85rem', fontWeight: 600, marginBottom: '0.5rem' }}>
                   Libros a Prestar (1 a 3 ejemplares)
                 </label>
+                <input
+                  type="search"
+                  aria-label="Buscar libro por tÃ­tulo o autor"
+                  placeholder="Buscar libro por tÃ­tulo o autorâ€¦"
+                  value={loanBookQuery}
+                  onChange={e => setLoanBookQuery(e.target.value)}
+                  style={{ width: '100%', padding: '0.5rem', border: '1px solid #cbd5e1', borderRadius: '4px', marginBottom: '0.5rem' }}
+                />
                 {[0, 1, 2].map(idx => (
                   <div key={idx} style={{ marginBottom: '0.5rem' }}>
                     <select
@@ -757,9 +883,15 @@ export default function App() {
                       style={{ width: '100%', padding: '0.5rem', border: '1px solid #cbd5e1', borderRadius: '4px', fontSize: '0.85rem' }}
                     >
                       <option value="">{idx === 0 ? '-- Libro Obligatorio (1) --' : `-- Libro Opcional (${idx + 1}) --`}</option>
-                      {books.filter(b => b.available_copies > 0).map(b => (
-                        <option key={b.id} value={b.id}>{b.title} (Disp: {b.available_copies})</option>
-                      ))}
+                      {(() => {
+                        const chosenElsewhere = loanForm.items.filter((id, i) => i !== idx && id);
+                        const options = loanBooks.filter(b => b.available_copies > 0 && !chosenElsewhere.includes(b.id));
+                        const current = loanForm.items[idx];
+                        if (current && !options.some(b => b.id === current) && bookCache[current]) options.unshift(bookCache[current]);
+                        return options.map(b => (
+                          <option key={b.id} value={b.id}>{b.title} (Disp: {b.available_copies})</option>
+                        ));
+                      })()}
                     </select>
                   </div>
                 ))}
@@ -767,7 +899,7 @@ export default function App() {
 
               <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.75rem' }}>
                 <button type="button" onClick={() => setLoanModal(false)} style={{ background: '#f1f5f9', border: 'none', padding: '0.5rem 1rem', borderRadius: '4px' }}>Cancelar</button>
-                <button type="submit" style={{ background: '#2563eb', color: '#fff', border: 'none', padding: '0.5rem 1rem', borderRadius: '4px', fontWeight: 600 }}>Confirmar PrÃƒÂ©stamo</button>
+                <button type="submit" style={{ background: '#2563eb', color: '#fff', border: 'none', padding: '0.5rem 1rem', borderRadius: '4px', fontWeight: 600 }}>Confirmar PrÃ©stamo</button>
               </div>
             </form>
           </div>
@@ -775,7 +907,7 @@ export default function App() {
       )}
 
         </div>
-        <footer className="workspace-footer"><span>NEXO Biblioteca</span><span>GestiÃƒÂ³n de colecciones Ã‚Â· ADSO 3413974</span></footer>
+        <footer className="workspace-footer"><span>NEXO Biblioteca</span><span>GestiÃ³n de colecciones</span></footer>
       </div>
     </div>
   );
